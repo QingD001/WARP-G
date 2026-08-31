@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "warp-g"
+version = "0.1.0"
+description = "Workload-Aware Regional Physical Graph materialization for retrieval"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+    "numpy>=1.24",
+    "torch>=2.2",
+    "lightgbm>=4.0",
+    "sentence-transformers>=3.0",
+    "igraph>=0.11",
+    "leidenalg>=0.10",
+    "datasets>=2.18",
+    "tiktoken>=0.7",
+    "faiss-cpu>=1.8",
+    "hipporag @ git+https://github.com/OSU-NLP-Group/HippoRAG.git@c617143f01477243992a63b2e2151cc003dd3b21",
+]
+
+[project.scripts]
+warp-g = "warp.run:main"
+
+[tool.setuptools.packages.find]
+include = ["warp*"]

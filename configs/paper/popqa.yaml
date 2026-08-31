@@ -1,0 +1,54 @@
+dataset:
+  name: popqa
+  corpus: data/processed/popqa/corpus.jsonl
+  queries: data/processed/popqa/queries.jsonl
+warp:
+  retrieval_k: 10
+  candidate_k: 50
+  routing_k: 20
+  coaccess_k: 20
+  semantic_k: 5
+  semantic_lambda: 0.05
+  probe_fraction: 0.2
+  benefit_objective: complete_evidence
+  dispersion_pairs: 4096
+  interaction_pairs: 30
+  partition_mode: combined
+  min_region_size: 5
+  seed: 42
+graph:
+  artifact_root: outputs/indexes/popqa
+  llm_name: gpt-4o-mini-2024-07-18
+  llm_base_url: https://api.openai.com/v1
+  embedding_model_name: nvidia/NV-Embed-v2
+  embedding_batch_size: 8
+  retrieval_top_k: 200
+  linking_top_k: 5
+  qa_top_k: 5
+  damping: 0.5
+  passage_node_weight: 0.05
+  synonymy_edge_topk: 2047
+  synonymy_edge_sim_threshold: 0.8
+  graph_type: facts_and_sim_passage_node_unidirectional
+  input_usd_per_million_tokens: 0.15
+  output_usd_per_million_tokens: 0.60
+reranker:
+  model_name: BAAI/bge-reranker-v2-m3
+  revision: b5160aeac3c6c8fe7beaaaf04c9e0142826b58d1
+  batch_size: 32
+  max_length: 512
+experiment:
+  cross_fitting_folds: 5
+  budgets: [0, 0.1, 0.2, 0.4, 0.6, 1.0]
+  methods: [ket_rag, g2cons, random_region, frequency_only, gain_only, cost_only, warp]
+  seed: 42
+  randomization_samples: 10000
+  partition_ablations:
+    modes: [query, semantic, random]
+    seed: 42
+    budget: 0.2
+reader:
+  enabled: true
+  budget: 0.2
+  top_k: 5
+  methods: [bm25, dense, hybrid, hipporag2, full_graph, ket_rag, g2cons, warp]

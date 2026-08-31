@@ -1,0 +1,21 @@
+repositories:
+  linearrag:
+    url: https://github.com/DEEP-PolyU/LinearRAG.git
+    commit: bcc94e66c221f798801255efba09311d6fbcd8d6
+  lightrag:
+    url: https://github.com/HKUDS/LightRAG.git
+    commit: d49112fb7548ee14cb727d43bd68e34da0a2c942
+
+linearrag:
+  embedding_model: sentence-transformers/all-mpnet-base-v2
+  spacy_model: en_core_web_trf
+  llm_model: gpt-4o-mini
+  max_workers: 16
+  retrieval_top_k: 10
+
+lightrag:
+  llm_model: gpt-4o-mini
+  embedding_model: text-embedding-3-small
+  mode: hybrid
+  top_k: 10
+  chunk_top_k: 10
