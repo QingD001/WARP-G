@@ -23,6 +23,7 @@ from typing import Any
 from warp.models import ConstructionCost, Document, Region, SearchResult
 from warp.utils import tokenize, write_json
 from .builder import RegionalGraph
+from .openie_guard import harden_hipporag
 
 
 UPSTREAM_REPOSITORY = "https://github.com/OSU-NLP-Group/HippoRAG"
@@ -88,6 +89,7 @@ class HippoRAG2Config:
     dataset: str | None = None
     llm_name: str = "gpt-4o-mini"
     llm_base_url: str | None = "https://api.openai.com/v1"
+    disable_llm_thinking: bool = False
     embedding_model_name: str = "nvidia/NV-Embed-v2"
     embedding_base_url: str | None = None
     azure_endpoint: str | None = None
@@ -187,7 +189,7 @@ class HippoRAG2GraphBuilder:
             )
 
     def estimate_cost(self, region: Region, documents: list[Document]) -> float:
-        """正式构图前同样使用区域文本 token proxy 做 matched budget。"""
+        """正式构图前用区域文本 token 数作为 score_i 的成本估计。"""
         selected = set(region.doc_ids)
         return float(sum(len(tokenize(doc.content)) for doc in documents if doc.id in selected))
 
@@ -245,6 +247,26 @@ class HippoRAG2GraphBuilder:
         shared_config = self._base_config(BaseConfig, shared_dir)
         if self._shared_llm is None:
             self._shared_llm = _get_llm_class(shared_config)
+            if self.config.disable_llm_thinking:
+                generate_params = getattr(
+                    getattr(self._shared_llm, "llm_config", None), "generate_params", None,
+                )
+                if not isinstance(generate_params, dict):
+                    raise RuntimeError(
+                        "The configured HippoRAG LLM does not expose mutable generate_params; "
+                        "cannot disable thinking mode safely."
+                    )
+                generate_params["extra_body"] = {"thinking": {"type": "disabled"}}
+                cache_file_name = getattr(self._shared_llm, "cache_file_name", None)
+                if not isinstance(cache_file_name, str):
+                    raise RuntimeError(
+                        "The configured HippoRAG LLM does not expose cache_file_name; "
+                        "cannot isolate non-thinking responses safely."
+                    )
+                cache_path = Path(cache_file_name)
+                self._shared_llm.cache_file_name = str(
+                    cache_path.with_name(f"{cache_path.stem}_thinking-disabled{cache_path.suffix}")
+                )
         if self._shared_embedding_model is None:
             embedding_class = _get_embedding_model_class(self.config.embedding_model_name)
             self._shared_embedding_model = embedding_class(
@@ -338,6 +360,7 @@ class HippoRAG2GraphBuilder:
         rag.openie.llm_model = self._shared_llm
         rag.rerank_filter.llm_infer_fn = self._shared_llm.infer
         rag._warp_usage_tracker = tracker
+        harden_hipporag(rag)
         started = time.perf_counter()
         before_usage = tracker.get("construction")
         tracker.phase = "construction"

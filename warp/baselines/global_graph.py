@@ -1,12 +1,14 @@
-"""KET-RAG、G2ConS 与 document-level matched-budget baselines。
+"""KET-RAG、G2ConS 的原生完整 pipeline。
 
 KET-RAG 实现 KG skeleton + keyword bipartite retrieval；G2ConS 实现 concept graph +
 core-KG dual-path retrieval。两者的昂贵 KG 都调用与 WARP 相同的 HippoRAG2 builder。
+核心文档集按各自论文的篇数比例选取（默认 β=κ=0.8），不再套用 WARP token 预算。
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from collections import defaultdict
@@ -62,14 +64,13 @@ def _pagerank(nodes: list[str], edges: dict[tuple[str, str], float], damping: fl
     return rank
 
 
-def _select_by_cost(ranked: list[str], costs: dict[str, float], budget: float) -> list[str]:
-    selected: list[str] = []
-    spent = 0.0
-    for doc_id in ranked:
-        if spent + costs[doc_id] <= budget + 1e-9:
-            selected.append(doc_id)
-            spent += costs[doc_id]
-    return selected
+def _select_core(ranked: list[str], fraction: float) -> list[str]:
+    if not ranked:
+        raise ValueError("Core selection requires a non-empty ranking")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("Core fraction must be in (0, 1]")
+    count = max(1, math.ceil(fraction * len(ranked)))
+    return ranked[:count]
 
 
 @dataclass
@@ -160,12 +161,13 @@ class _ConceptResources:
 
 
 class GlobalBaselineFactory:
-    """一次构建 KET/G2ConS 轻量资源，并按预算物化各自 core graph。"""
+    """一次构建 KET/G2ConS 轻量资源，并按各自原生 core 比例物化骨架图。"""
 
     def __init__(self, documents: list[Document], base: HybridRetriever, graph_builder: GraphBuilder,
                  graph_retriever: GraphRetriever, reranker: Reranker, candidate_k: int,
                  ket_knn_k: int = 10, g2_semantic_threshold: float = 0.65,
-                 g2_cooccurrence_threshold: int = 3) -> None:
+                 g2_cooccurrence_threshold: int = 3,
+                 ket_core_fraction: float = 0.8, g2_core_fraction: float = 0.8) -> None:
         self.documents = documents
         self.doc_map = {doc.id: doc for doc in documents}
         self.base = base
@@ -176,6 +178,10 @@ class GlobalBaselineFactory:
         self.doc_costs = {doc.id: float(len(tokenize(doc.content))) for doc in documents}
         if any(cost <= 0 for cost in self.doc_costs.values()):
             raise ValueError("Global baselines require non-empty documents")
+        if not 0.0 < ket_core_fraction <= 1.0 or not 0.0 < g2_core_fraction <= 1.0:
+            raise ValueError("KET/G2 core fractions must be in (0, 1]")
+        self.ket_core_fraction = ket_core_fraction
+        self.g2_core_fraction = g2_core_fraction
         self.resources = _ConceptResources(documents, base.dense)
         self.ket_index, self.ket_ranking = self._build_ket(ket_knn_k)
         self.g2_index, self.g2_ranking = self._build_g2(g2_semantic_threshold, g2_cooccurrence_threshold)
@@ -252,31 +258,17 @@ class GlobalBaselineFactory:
             self.resources.concept_to_docs, edges, cost,
         ), ranking
 
-    def build(self, method: str, graph_budget: float) -> "GlobalGraphBaseline":
+    def build(self, method: str, core_fraction: float | None = None) -> "GlobalGraphBaseline":
         method = method.lower()
-        if graph_budget < 0:
-            raise ValueError("Global baseline budget must be non-negative")
-        if graph_budget == 0:
-            return GlobalGraphBaseline(
-                method, self.base, self.graph_retriever, self.reranker,
-                self.candidate_k, None, None,
-            )
         if method == "ket_rag":
-            ranking, lightweight = self.ket_ranking, self.ket_index
+            ranking, lightweight, default_fraction = self.ket_ranking, self.ket_index, self.ket_core_fraction
         elif method == "g2cons":
-            ranking, lightweight = self.g2_ranking, self.g2_index
+            ranking, lightweight, default_fraction = self.g2_ranking, self.g2_index, self.g2_core_fraction
         else:
             raise ValueError(f"Unknown global baseline: {method}")
-        lightweight_cost = lightweight.cost.selection_cost if lightweight is not None else 0.0
-        if lightweight_cost > graph_budget:
-            return GlobalGraphBaseline(
-                method, self.base, self.graph_retriever, self.reranker,
-                self.candidate_k, None, None,
-            )
-        selected = _select_by_cost(ranking, self.doc_costs, graph_budget - lightweight_cost)
-        graph = None
-        if selected:
-            graph = self.graph_builder.build(Region(f"__{method}__", selected), self.documents)
+        fraction = default_fraction if core_fraction is None else core_fraction
+        selected = _select_core(ranking, fraction)
+        graph = self.graph_builder.build(Region(f"__{method}__", selected), self.documents)
         return GlobalGraphBaseline(
             method, self.base, self.graph_retriever, self.reranker, self.candidate_k,
             graph, lightweight,

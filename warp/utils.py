@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -57,11 +60,65 @@ def read_json_records(path: str | Path) -> list[dict[str, Any]]:
 
 
 def write_json(path: str | Path, value: Any) -> None:
-    """创建父目录并以 UTF-8、可读缩进形式原子化语义地写结果。"""
+    """创建父目录，先写临时文件再 replace，避免崩溃留下半截 JSON。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
+    handle, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def utc_run_stamp() -> str:
+    """Filesystem-safe UTC stamp used as a paper-run directory name."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def point_latest_run(parent: Path, run_dir: Path) -> Path:
+    """Point `parent/latest` at `run_dir` with a relative symlink."""
+    parent = parent.resolve()
+    run_dir = run_dir.resolve()
+    if run_dir.parent != parent:
+        raise ValueError(f"Run directory {run_dir} is not a child of {parent}")
+    latest = parent / "latest"
+    if latest.is_symlink() or latest.is_file():
+        latest.unlink()
+    elif latest.exists():
+        raise FileExistsError(f"Refusing to replace non-symlink path {latest}")
+    latest.symlink_to(run_dir.name, target_is_directory=True)
+    return latest
+
+
+def create_timestamped_run_dir(parent: str | Path) -> Path:
+    """Create `parent/<UTC stamp>/` and retarget `parent/latest` to it."""
+    parent = Path(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    stamp = utc_run_stamp()
+    run_dir = parent / stamp
+    if run_dir.exists():
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
+        run_dir = parent / stamp
+    run_dir.mkdir(parents=False, exist_ok=False)
+    point_latest_run(parent, run_dir)
+    return run_dir
+
+
+def resolve_latest_run_dir(parent: str | Path) -> Path:
+    """Prefer `parent/latest` when present; otherwise treat `parent` as the run dir."""
+    parent = Path(parent)
+    latest = parent / "latest"
+    if latest.exists():
+        return latest.resolve()
+    return parent.resolve() if parent.exists() else parent
 
 
 def batches(values: list[Any], size: int) -> Iterable[list[Any]]:

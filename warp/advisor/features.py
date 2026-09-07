@@ -14,7 +14,10 @@ from warp.utils import cosine, tokenize
 
 
 class RegionFeatureExtractor:
-    """只依赖 corpus、train query、基础检索和便宜共访问图。"""
+    """只依赖 corpus、train query、基础检索和便宜共访问图。
+
+    base_recall / failure_rate / multi_doc_rate 只使用落在该 region 内的 gold。
+    """
     def __init__(self, routing_k: int = 20, candidate_k: int = 50, retrieval_k: int = 10,
                  dispersion_pairs: int = 4096, seed: int = 42) -> None:
         if candidate_k < routing_k or candidate_k < retrieval_k:
@@ -32,13 +35,18 @@ class RegionFeatureExtractor:
         queries: list[Query],
         retriever: HybridRetriever,
         coaccess: CoaccessGraph,
+        query_results: dict[str, list[SearchResult]] | None = None,
     ) -> tuple[dict[str, RegionFeatures], dict[str, list[str]], dict[str, list[SearchResult]]]:
-        """返回特征、region-query 路由关系和可复用的 base results。"""
+        """返回特征、region-query 路由关系和可复用的 Base 排序结果。"""
         doc_map = {doc.id: doc for doc in documents}
         doc_region = {doc_id: region.id for region in regions for doc_id in region.doc_ids}
-        query_results: dict[str, list[SearchResult]] = {
-            query.id: retriever.search(query.text, self.candidate_k) for query in queries
-        }
+        if query_results is None:
+            query_results = {
+                query.id: retriever.search(query.text, self.candidate_k) for query in queries
+            }
+        missing = [query.id for query in queries if query.id not in query_results]
+        if missing:
+            raise ValueError(f"Feature extraction is missing Base results for queries: {missing[:10]}")
         # 一个 query 可访问多个 region，但在同一区域只计一次 query_freq。
         region_queries: dict[str, list[str]] = defaultdict(list)
         for query in queries:
@@ -60,22 +68,20 @@ class RegionFeatureExtractor:
             region_docs = set(region.doc_ids)
             for qid in qids:
                 query = query_map[qid]
-                # recall/failure 对齐 probe 标签与最终指标的深度 (retrieval_k)。
+                # 构图前特征只统计本区 gold；probe 标签仍用整题 CompleteEvidence。
                 ranked = query_results[qid][:self.retrieval_k]
                 retrieved = {result.doc_id for result in ranked}
-                gold = set(query.gold_doc_ids)
-                region_gold = gold & region_docs
-                if gold:
-                    recalls.append(len(gold & retrieved) / len(gold))
-                    failures.append(float(not gold.issubset(retrieved)))
+                region_gold = set(query.gold_doc_ids) & region_docs
+                if region_gold:
+                    recalls.append(len(region_gold & retrieved) / len(region_gold))
+                    failures.append(float(not region_gold.issubset(retrieved)))
+                    multi_docs.append(float(len(region_gold) >= 2))
                 scores = [max(result.score, 0.0) for result in ranked if result.doc_id in region_docs]
                 total = sum(scores)
                 if total > 0 and len(scores) > 1:
                     probabilities = [score / total for score in scores]
                     entropy = -sum(p * math.log(p + 1e-12) for p in probabilities) / math.log(len(scores))
                     entropies.append(entropy)
-                if region_gold:
-                    multi_docs.append(float(len(region_gold) > 1 or len(gold) > 1))
 
             # dispersion 与 density 分别刻画语义异质性和真实 workload 内聚性。
             pair_count = len(region.doc_ids) * (len(region.doc_ids) - 1) // 2

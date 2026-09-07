@@ -43,13 +43,22 @@ class CoaccessGraphBuilder:
         self.semantic_lambda = semantic_lambda
         self.min_semantic_similarity = min_semantic_similarity
 
-    def build(self, documents: list[Document], queries: list[Query], retriever: HybridRetriever) -> CoaccessGraph:
-        """为每个设计 query 的 top-k 文档两两加边，再补语义邻居弱边。"""
+    def build(
+        self,
+        documents: list[Document],
+        queries: list[Query],
+        retriever: HybridRetriever,
+        query_top_ids: dict[str, list[str]] | None = None,
+    ) -> CoaccessGraph:
+        """为每个设计 query 的 Base top-k 文档两两加边，再补语义邻居弱边。"""
         # query_edges 是真实 workload 共访问强度，也是社区划分的主要信号。
         query_edges: dict[tuple[str, str], float] = defaultdict(float)
         query_results: dict[str, list[str]] = {}
         for query in queries:
-            ids = [result.doc_id for result in retriever.search(query.text, self.top_k)]
+            if query_top_ids is not None:
+                ids = list(query_top_ids[query.id][:self.top_k])
+            else:
+                ids = [result.doc_id for result in retriever.search(query.text, self.top_k)]
             query_results[query.id] = ids
             for left, right in combinations(sorted(set(ids)), 2):
                 query_edges[(left, right)] += 1.0

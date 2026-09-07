@@ -18,10 +18,11 @@ warp:
   seed: 42
 graph:
   artifact_root: outputs/indexes/popqa
-  llm_name: gpt-4o-mini-2024-07-18
-  llm_base_url: https://api.openai.com/v1
+  llm_name: deepseek-v4-flash
+  llm_base_url: https://yibuapi.com/v1
+  disable_llm_thinking: true
   embedding_model_name: nvidia/NV-Embed-v2
-  embedding_batch_size: 8
+  embedding_batch_size: 2
   retrieval_top_k: 200
   linking_top_k: 5
   qa_top_k: 5
@@ -39,16 +40,15 @@ reranker:
   max_length: 512
 experiment:
   cross_fitting_folds: 5
-  budgets: [0, 0.1, 0.2, 0.4, 0.6, 1.0]
-  methods: [ket_rag, g2cons, random_region, frequency_only, gain_only, cost_only, warp]
+  methods: [warp, random_region, frequency_only, gain_only, cost_only, ket_rag, g2cons]
+  ket_core_fraction: 0.8
+  g2_core_fraction: 0.8
   seed: 42
   randomization_samples: 10000
   partition_ablations:
     modes: [query, semantic, random]
     seed: 42
-    budget: 0.2
 reader:
   enabled: true
-  budget: 0.2
   top_k: 5
   methods: [bm25, dense, hybrid, hipporag2, full_graph, ket_rag, g2cons, warp]

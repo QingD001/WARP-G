@@ -1,10 +1,11 @@
 # WARP-G
 
 WARP-G 是一个面向科研实验的 workload-aware regional graph materialization 系统。它在共享语料上先建立
-BM25 + NV-Embed-v2 基础检索，再根据训练 workload 把文档划分为 regions，少量构建 HippoRAG2 probe graph，
-用 LightGBM 预测每个 region 的构图收益，最后在预算约束下只物化最值得构建的区域图。
+BM25 + NV-Embed-v2 + CrossEncoder 基础检索，再根据训练 workload 把文档划分为 regions，少量构建 HippoRAG2
+probe graph，用 LightGBM 预测每个 region 的构图收益，并物化所有 `score_i > 0` 的区域图。各方法不设 token
+预算截断，完整跑完后比较检索效果与总消耗 tokens。
 
-正式实验固定使用 `seed=42`。主预算曲线比较 KET-RAG、G2ConS、Random-region、Frequency-only、Gain-only、
+正式实验固定使用 `seed=42`。主比较为 KET-RAG、G2ConS、Random-region、Frequency-only、Gain-only、
 Cost-only 和 WARP-G；BM25、Dense、Hybrid、HippoRAG2 graph-only 和 Base + Full Graph 作为标准参考方法。
 LinearRAG 与 LightRAG 使用锁定的作者官方实现运行独立端到端对照。详细研究假设与评测口径见
 [design.md](design.md)，所有已讨论工作的介绍、差异和官方代码状态见 [related_work.md](related_work.md)。
@@ -18,7 +19,7 @@ HippoRAG2 corpus + 1,000 released queries
 deterministic 5-fold cross-fitting
             │
             ▼
-BM25 + Dense + RRF 基础索引
+BM25 + Dense + RRF + CrossEncoder 基础索引
             │
             ▼
 train-query coaccess graph + semantic kNN
@@ -33,10 +34,10 @@ cheap region features + stratified graph probes
 LightGBM benefit prediction
             │
             ▼
-budgeted regional materialization
+materialize all regions with score_i > 0
             │
-            ├── WARP-G 与四个 region-selector ablations
-            ├── KET-RAG / G2ConS matched-backend comparison
+            ├── WARP-G 与四个 region-selector ablations（相同区域数）
+            ├── KET-RAG / G2ConS 完整 pipeline
             └── retrieval、reader、cost、significance artifacts
 ```
 
@@ -47,7 +48,7 @@ WARP-G/
 ├── configs/paper/          四个数据集的正式实验配置
 ├── scripts/                数据准备、整套实验执行和结果导出脚本
 ├── warp/
-│   ├── advisor/            特征、probe、收益预测和预算选择
+│   ├── advisor/            特征、probe、收益预测和区域选择
 │   ├── baselines/          KET-RAG 与 G2ConS
 │   ├── data/               数据 schema 适配与加载
 │   ├── eval/               检索、reader、统计和成本评测
@@ -315,11 +316,13 @@ query set 并由 runner 做五折交叉拟合。
 #### `scripts/run_paper_suite.py`
 
 依次启动 HotpotQA、2Wiki、MuSiQue 和 PopQA 四份正式配置。每个数据集使用独立 Python 进程，便于上一份
-数据集结束后释放 GPU 模型与图内存；任意进程失败都会直接终止整套运行。
+数据集结束后释放 GPU 模型与图内存；任意进程失败都会直接终止整套运行。每次调用在
+`outputs/paper/<UTC时间戳>/` 下归档该次结果，并把 `outputs/paper/latest` 指到这次目录；图 index
+仍写在 `outputs/indexes/`，按 fingerprint 跨次复用。可用 `--run-dir` 把后续数据集写入已有归档。
 
 #### `scripts/export_paper_results.py`
 
-读取四个正式 JSON artifacts，将嵌套结果展开成论文绘图和制表使用的 tidy CSV：baseline、quality-cost
+默认读取 `outputs/paper/latest`，将嵌套结果展开成该次归档下的 tidy CSV：baseline、quality-cost
 trials/summary/AUC、partition ablation、reader 和 Holm-corrected paired significance。
 
 #### `scripts/prepare_official_baselines.py`
@@ -411,15 +414,30 @@ passage ID，验证所有 gold evidence，并写入 `queries.jsonl` 与 `split_m
 python3 scripts/run_paper_suite.py
 ```
 
-运行单个数据集：
+结果写入例如 `outputs/paper/2026-09-02T08-26-00Z/{hotpotqa,2wiki,musique,popqa}.json`，
+`outputs/paper/latest` 始终指向最近一次归档。运行单个数据集同样走 suite，以免覆盖旧结果：
 
 ```bash
-python3 -m warp.run \
-  --config configs/paper/hotpotqa.yaml \
-  --output outputs/paper/hotpotqa.json
+python3 scripts/run_paper_suite.py --datasets hotpotqa
 ```
 
-导出论文 CSV：
+默认入口会按顺序启动互相隔离的子进程：先运行主实验，再分别运行每个 partition ablation。每个阶段结束后
+GPU 模型随子进程退出而完整释放。主实验每折结束后立刻写入
+`hotpotqa.main.fold-0.json` 和可打开的 `hotpotqa.main.partial.json`；`fit` 完成后还会先写
+`hotpotqa.main.fold-0.design.json`。重启同一 `--output` 会跳过已完成的折，并复用已有 HippoRAG
+region 图与 probe 标签。阶段结果另保存在 `hotpotqa.main.json`、`hotpotqa.partition-query.json` 等
+文件中，最后合并为 `hotpotqa.json`。调试时也可以把 `--output` 指到某次归档里的显式路径：
+
+```bash
+python3 -m warp.run --config configs/paper/hotpotqa.yaml \
+  --output outputs/paper/latest/hotpotqa.main.json --phase main
+
+python3 -m warp.run --config configs/paper/hotpotqa.yaml \
+  --output outputs/paper/latest/hotpotqa.partition-query.json \
+  --phase partition-ablation --partition-mode query
+```
+
+导出最近一次归档的论文 CSV（默认写到该归档的 `tables/`）：
 
 ```bash
 python3 scripts/export_paper_results.py

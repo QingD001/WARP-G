@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
+from pathlib import Path
 
 from warp.graph.builder import GraphBuilder, RegionalGraph
 from warp.graph.retriever import GraphRetriever
 from warp.models import Document, Query, Region, RegionFeatures, SearchResult
 from warp.retrieval.hybrid import fuse_and_rerank
 from warp.retrieval.reranker import Reranker
+from warp.utils import write_json
+
+
+PROBE_OUTCOME_NAME = "warp_probe_outcome.json"
 
 
 def evidence_recall(results: list[SearchResult], gold_doc_ids: list[str]) -> float:
+    """整题 Evidence Recall：gold 为该 query 的全部证据，不按 region 截断。"""
     gold = set(gold_doc_ids)
     if not gold:
         raise ValueError("Probe queries require gold evidence")
@@ -20,6 +27,7 @@ def evidence_recall(results: list[SearchResult], gold_doc_ids: list[str]) -> flo
 
 
 def complete_evidence(results: list[SearchResult], gold_doc_ids: list[str]) -> float:
+    """整题 CompleteEvidence：全部 gold 是否都进入结果，与评测指标 M 相同。"""
     gold = set(gold_doc_ids)
     if not gold:
         raise ValueError("Probe queries require gold evidence")
@@ -39,7 +47,11 @@ class ProbeOutcome:
 
 
 class RegionProber:
-    """使用与上线检索完全一致的 RRF + CrossEncoder 计算 counterfactual gain。"""
+    """按最终部署路径测量 Graph_i 对整题 M 的边际增益。
+
+    y_i 对路由到该区的 design query 平均 CompleteEvidence@10(Base+Graph_i) 与 Base 的差。
+    gold 集合是该 query 的全部证据，不是 region ∩ gold。
+    """
 
     def __init__(
         self, graph_builder: GraphBuilder, graph_retriever: GraphRetriever, reranker: Reranker,
@@ -83,6 +95,20 @@ class RegionProber:
         outcomes: dict[str, ProbeOutcome] = {}
         for region in probe_regions:
             graph = self.graph_builder.build(region, documents)
+            outcome_path = _probe_outcome_path(graph)
+            if outcome_path.exists():
+                outcomes[region.id] = _load_probe_outcome(outcome_path, graph)
+                print(json.dumps({
+                    "probe_checkpoint": "reuse",
+                    "region_id": region.id,
+                    "path": str(outcome_path),
+                }, ensure_ascii=False), flush=True)
+                continue
+            print(json.dumps({
+                "probe_checkpoint": "label",
+                "region_id": region.id,
+                "path": str(outcome_path),
+            }, ensure_ascii=False), flush=True)
             base_recall_values: list[float] = []
             graph_recall_values: list[float] = []
             base_complete_values: list[float] = []
@@ -118,4 +144,54 @@ class RegionProber:
                 region.id, gain, recall_gain, complete_gain, base_utility, graph_utility,
                 len(base_recall_values), graph,
             )
+            write_json(outcome_path, _probe_outcome_payload(outcomes[region.id]))
+            print(json.dumps({
+                "probe_checkpoint": "saved",
+                "region_id": region.id,
+                "path": str(outcome_path),
+                "gain": outcomes[region.id].gain,
+                "query_count": outcomes[region.id].query_count,
+            }, ensure_ascii=False), flush=True)
         return outcomes
+
+
+def _probe_outcome_path(graph: RegionalGraph) -> Path:
+    artifact_dir = graph.metadata.get("artifact_dir")
+    if not artifact_dir:
+        raise RuntimeError("Probe graph is missing artifact_dir metadata")
+    return Path(artifact_dir) / PROBE_OUTCOME_NAME
+
+
+def _probe_outcome_payload(outcome: ProbeOutcome) -> dict[str, float | int | str]:
+    return {
+        "region_id": outcome.region_id,
+        "gain": outcome.gain,
+        "recall_gain": outcome.recall_gain,
+        "complete_gain": outcome.complete_gain,
+        "base_utility": outcome.base_utility,
+        "graph_utility": outcome.graph_utility,
+        "query_count": outcome.query_count,
+    }
+
+
+def _load_probe_outcome(path: Path, graph: RegionalGraph) -> ProbeOutcome:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "region_id", "gain", "recall_gain", "complete_gain",
+        "base_utility", "graph_utility", "query_count",
+    }
+    missing = required - set(payload)
+    if missing:
+        raise ValueError(f"{path} is missing probe outcome fields: {sorted(missing)}")
+    if str(payload["region_id"]) != graph.region_id:
+        raise ValueError(f"{path} region_id does not match graph {graph.region_id}")
+    return ProbeOutcome(
+        str(payload["region_id"]),
+        float(payload["gain"]),
+        float(payload["recall_gain"]),
+        float(payload["complete_gain"]),
+        float(payload["base_utility"]),
+        float(payload["graph_utility"]),
+        int(payload["query_count"]),
+        graph,
+    )

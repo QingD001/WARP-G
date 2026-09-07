@@ -76,7 +76,7 @@ class ConstructionCost:
 
     @property
     def selection_cost(self) -> float:
-        """Stable pre-construction cost proxy used by the budget selector."""
+        """Stable pre-construction token-proxy used in WARP score_i and reports."""
         return float(self.input_tokens + self.output_tokens + self.embedding_tokens)
 
     def to_dict(self) -> dict[str, Any]:

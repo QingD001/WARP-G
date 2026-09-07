@@ -8,6 +8,7 @@ dev/test query。图 builder、图 retriever、base retriever 和 reranker 均�
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import json
 import time
 import random
 import statistics
@@ -16,7 +17,7 @@ from typing import Any
 from warp.advisor.features import RegionFeatureExtractor
 from warp.advisor.predictor import BenefitPredictor
 from warp.advisor.probe import ProbeOutcome, RegionProber, complete_evidence, evidence_recall
-from warp.advisor.selector import BudgetSelector
+from warp.advisor.selector import RegionSelector
 from warp.eval.construction_cost import aggregate_costs
 from warp.eval.retrieval import evaluate_retrieval
 from warp.graph.builder import GraphBuilder, RegionalGraph
@@ -49,8 +50,8 @@ class WARPConfig:
     def __post_init__(self) -> None:
         if self.retrieval_k <= 0 or self.routing_k <= 0 or self.candidate_k < max(self.retrieval_k, self.routing_k):
             raise ValueError("candidate_k must cover positive retrieval_k and routing_k")
-        if self.dispersion_pairs <= 0 or self.min_region_size <= 0 or self.interaction_pairs <= 0:
-            raise ValueError("dispersion_pairs, interaction_pairs and min_region_size must be positive")
+        if self.dispersion_pairs <= 0 or self.min_region_size <= 0 or self.interaction_pairs < 0:
+            raise ValueError("dispersion_pairs and min_region_size must be positive; interaction_pairs must be >= 0")
         if self.partition_mode not in {"combined", "query", "semantic", "random"}:
             raise ValueError("partition_mode must be combined, query, semantic, or random")
 
@@ -66,7 +67,7 @@ class WARPG:
         self.graph_builder = graph_builder
         self.graph_retriever = graph_retriever
         self.reranker = reranker
-        self.selector = BudgetSelector(config.seed)
+        self.selector = RegionSelector(config.seed)
         self.bundle: DatasetBundle | None = None
         self.coaccess: CoaccessGraph | None = None
         self.regions: list[Region] = []
@@ -105,15 +106,32 @@ class WARPG:
             if missing:
                 raise ValueError(f"{split_name} gold evidence is absent from corpus: {missing[:10]}")
         self.bundle = bundle
+        # design.md 顺序：Base 索引 → partition → features → probe → predictor → selection。
         # Base 索引覆盖 100% corpus，是所有方法共享且不计为选择性 Graph 成本的底座。
         started = time.perf_counter()
         self.base.fit(bundle.documents)
         self.design_timings["base_index_seconds"] = time.perf_counter() - started
         # 下面所有 workload 信号只来自 bundle.train，避免 test leakage。
         started = time.perf_counter()
+        hybrid_by_query = {
+            query.id: self.base.search(query.text, self.config.candidate_k) for query in bundle.train
+        }
+        base_by_query = {
+            query.id: fuse_and_rerank(
+                query.text, [hybrid_by_query[query.id]], self.reranker,
+                k=self.config.candidate_k, candidate_k=self.config.candidate_k, source="hybrid_reranked",
+            )
+            for query in bundle.train
+        }
         self.coaccess = CoaccessGraphBuilder(
             self.config.coaccess_k, self.config.semantic_k, self.config.semantic_lambda,
-        ).build(bundle.documents, bundle.train, self.base)
+        ).build(
+            bundle.documents, bundle.train, self.base,
+            query_top_ids={
+                query.id: [result.doc_id for result in base_by_query[query.id]]
+                for query in bundle.train
+            },
+        )
         partitioner = RegionPartitioner(
             resolution=self.config.partition_resolution, seed=self.config.seed,
             min_region_size=self.config.min_region_size,
@@ -152,8 +170,9 @@ class WARPG:
             self.config.routing_k, self.config.candidate_k, self.config.retrieval_k,
             self.config.dispersion_pairs, self.config.seed,
         )
-        self.features, self.region_queries, base_results = extractor.extract(
+        self.features, self.region_queries, _ = extractor.extract(
             self.regions, bundle.documents, bundle.train, self.base, self.coaccess,
+            query_results=base_by_query,
         )
         self.design_timings["feature_seconds"] = time.perf_counter() - started
         # 选择前只能使用 token proxy；actual cost 必须等真实 build 后才可观测。
@@ -166,8 +185,9 @@ class WARPG:
         )
         probe_regions = prober.select_probe_regions(self.regions, self.features, self.costs)
         labeling_before = self.graph_retriever.stats()
+        # probe 标签与最终系统共用 candidate/RRF/CE；融合前仍用 Hybrid 候选，避免双重 rerank。
         self.probes = prober.run(probe_regions, bundle.documents, bundle.train,
-                                 self.region_queries, base_results)
+                                 self.region_queries, hybrid_by_query)
         # probe 打标阶段的在线图检索 token 单独入账，供 design-search 口径完整报告。
         self.probe_labeling_online_cost = self.graph_retriever.delta(labeling_before)
         self.graphs.update({region_id: outcome.graph for region_id, outcome in self.probes.items()})
@@ -178,7 +198,14 @@ class WARPG:
         # A measured probe label is more reliable than its fitted value.
         self.predicted_gains.update(gains)
         self.design_timings["predictor_seconds"] = time.perf_counter() - started
-        self.interaction_analysis = self._probe_interactions()
+        if self.config.interaction_pairs == 0:
+            self.interaction_analysis = {
+                "pairs": [],
+                "mean_absolute_interaction": 0.0,
+                "skipped": True,
+            }
+        else:
+            self.interaction_analysis = self._probe_interactions()
         return self
 
     def routing_diagnostics(self, queries: list[Any]) -> dict[str, float]:
@@ -190,7 +217,7 @@ class WARPG:
         for query in eligible:
             gold_regions = {self.doc_region[doc_id] for doc_id in query.gold_doc_ids}
             routed = {self.doc_region[result.doc_id]
-                      for result in self.base.search(query.text, self.config.routing_k)}
+                      for result in self.rank_base(query.text, self.config.routing_k)}
             complete += float(gold_regions.issubset(routed))
             any_hit += float(bool(gold_regions & routed))
         return {
@@ -238,21 +265,32 @@ class WARPG:
 
     @property
     def full_graph_cost(self) -> float:
-        """返回所有区域 token proxy 之和，作为选择时预算分母。"""
+        """返回所有区域 token proxy 之和，仅作成本对照分母，不再用于截断。"""
         return sum(self.costs.values())
 
-    def select(self, budget_fraction: float, method: str = "warp") -> list[str]:
-        """把相对预算转换为绝对 proxy cost，并调用统一 BudgetSelector。"""
-        if not 0.0 <= budget_fraction <= 1.0:
-            raise ValueError("budget_fraction must be between 0 and 1")
+    def select(self, method: str = "warp") -> list[str]:
+        """WARP 按 score_i 选择；controls 只换排序公式，并取相同区域数。"""
+        warp_selected = self.selector.select("warp", self.features, self.costs, self.predicted_gains)
+        if method == "warp":
+            return warp_selected
         return self.selector.select(
-            method, budget_fraction * self.full_graph_cost, self.features, self.costs, self.predicted_gains,
+            method, self.features, self.costs, self.predicted_gains, limit=len(warp_selected),
+        )
+
+    def rank_base(self, query: str, k: int | None = None) -> list[SearchResult]:
+        """统一 Base：BM25 + NV-Embed → RRF → pinned CrossEncoder → top-k。"""
+        k = self.config.retrieval_k if k is None else k
+        return fuse_and_rerank(
+            query, [self.base.search(query, self.config.candidate_k)], self.reranker,
+            k=k, candidate_k=self.config.candidate_k, source="hybrid_reranked",
         )
 
     def search_base(self, query: str, k: int | None = None, method: str = "hybrid") -> list[SearchResult]:
         """所有 Base baseline 也走与图方法相同的 candidate depth 和 CrossEncoder。"""
         k = self.config.retrieval_k if k is None else k
-        retriever = {"bm25": self.base.bm25, "dense": self.base.dense, "hybrid": self.base}.get(method)
+        if method == "hybrid":
+            return self.rank_base(query, k)
+        retriever = {"bm25": self.base.bm25, "dense": self.base.dense}.get(method)
         if retriever is None:
             raise ValueError(f"Unknown base method: {method}")
         candidates = retriever.search(query, self.config.candidate_k)
@@ -265,26 +303,50 @@ class WARPG:
         """按需构建尚未缓存的区域图；probe 图会被安全复用。"""
         if self.bundle is None:
             raise RuntimeError("fit must be called first")
-        for region_id in region_ids:
-            if region_id not in self.graphs:
-                self.graphs[region_id] = self.graph_builder.build(self.region_map[region_id], self.bundle.documents)
+        pending = [region_id for region_id in region_ids if region_id not in self.graphs]
+        print(json.dumps({
+            "materialize": "start",
+            "requested": len(region_ids),
+            "cached": len(region_ids) - len(pending),
+            "pending": pending,
+        }, ensure_ascii=False), flush=True)
+        for index, region_id in enumerate(pending, 1):
+            print(json.dumps({
+                "materialize": "build",
+                "region_id": region_id,
+                "index": index,
+                "total": len(pending),
+                "num_docs": len(self.region_map[region_id].doc_ids),
+            }, ensure_ascii=False), flush=True)
+            self.graphs[region_id] = self.graph_builder.build(self.region_map[region_id], self.bundle.documents)
+            print(json.dumps({
+                "materialize": "saved",
+                "region_id": region_id,
+                "index": index,
+                "total": len(pending),
+            }, ensure_ascii=False), flush=True)
 
     def search(self, query: str, k: int | None = None, selected_regions: set[str] | None = None) -> list[SearchResult]:
-        """Base 路由到已物化区域，融合对应图结果后统一 rerank。"""
+        """先跑完整 Base，用 top-routing_k 查表，只查询已物化且被 Base 命中的图。"""
         k = self.config.retrieval_k if k is None else k
-        base_results = self.base.search(query, self.config.candidate_k)
+        base_candidates = self.base.search(query, self.config.candidate_k)
+        base_ranked = fuse_and_rerank(
+            query, [base_candidates], self.reranker,
+            k=max(self.config.routing_k, k), candidate_k=self.config.candidate_k,
+            source="hybrid_reranked",
+        )
         if selected_regions is None:
             selected_regions = set(self.graphs)
         # 路由是确定性的文档归属查表，不使用 LLM/agent 做检索决策。
         routed: list[str] = []
-        for result in base_results[:self.config.routing_k]:
+        for result in base_ranked[:self.config.routing_k]:
             region_id = self.doc_region[result.doc_id]
             if region_id in selected_regions and region_id not in routed:
                 routed.append(region_id)
         graph_results = [self.graph_retriever.search(query, self.graphs[region_id], self.config.candidate_k)
                          for region_id in routed if region_id in self.graphs]
         return fuse_and_rerank(
-            query, [base_results] + graph_results, self.reranker,
+            query, [base_candidates] + graph_results, self.reranker,
             k=k, candidate_k=self.config.candidate_k, source="warp",
         )
 
