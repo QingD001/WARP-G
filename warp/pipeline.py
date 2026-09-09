@@ -19,14 +19,17 @@ from warp.advisor.predictor import BenefitPredictor
 from warp.advisor.probe import ProbeOutcome, RegionProber, complete_evidence, evidence_recall
 from warp.advisor.selector import RegionSelector
 from warp.eval.construction_cost import aggregate_costs
+from warp.eval.cutoffs import RETRIEVAL_KS
 from warp.eval.retrieval import evaluate_retrieval
 from warp.graph.builder import GraphBuilder, RegionalGraph
 from warp.graph.retriever import GraphRetriever
 from warp.models import DatasetBundle, Region, RegionFeatures, SearchResult
+from warp.partition.boundary import region_coaccess_neighbors, replicate_boundaries
 from warp.partition.coaccess_graph import CoaccessGraph, CoaccessGraphBuilder
 from warp.partition.leiden import RegionPartitioner
 from warp.retrieval.hybrid import HybridRetriever, fuse_and_rerank
 from warp.retrieval.reranker import Reranker
+from warp.utils import cosine
 
 
 @dataclass
@@ -46,14 +49,36 @@ class WARPConfig:
     min_region_size: int = 1
     partition_mode: str = "combined"
     seed: int = 42
+    retrieval_ks: tuple[int, ...] = RETRIEVAL_KS
+    region_router_k: int = 3
+    bridge_k: int = 1
+    boundary_replication: float = 0.05
+    max_region_cost: float | None = None
+    coaccess_weight: str = "rank_idf"
+    probe_strategy: str = "active"
+    multistep_max_steps: int = 3
 
     def __post_init__(self) -> None:
+        if isinstance(self.retrieval_ks, list):
+            self.retrieval_ks = tuple(int(value) for value in self.retrieval_ks)
+        if not self.retrieval_ks or any(k <= 0 for k in self.retrieval_ks):
+            raise ValueError("retrieval_ks must be positive")
         if self.retrieval_k <= 0 or self.routing_k <= 0 or self.candidate_k < max(self.retrieval_k, self.routing_k):
             raise ValueError("candidate_k must cover positive retrieval_k and routing_k")
         if self.dispersion_pairs <= 0 or self.min_region_size <= 0 or self.interaction_pairs < 0:
             raise ValueError("dispersion_pairs and min_region_size must be positive; interaction_pairs must be >= 0")
         if self.partition_mode not in {"combined", "query", "semantic", "random"}:
             raise ValueError("partition_mode must be combined, query, semantic, or random")
+        if self.coaccess_weight not in {"count", "rank_idf"}:
+            raise ValueError("coaccess_weight must be count or rank_idf")
+        if self.probe_strategy not in {"active", "stratified"}:
+            raise ValueError("probe_strategy must be active or stratified")
+        if self.region_router_k < 0 or self.bridge_k < 0:
+            raise ValueError("region_router_k and bridge_k must be >= 0")
+        if not 0.0 <= self.boundary_replication <= 1.0:
+            raise ValueError("boundary_replication must be in [0, 1]")
+        if self.multistep_max_steps < 0:
+            raise ValueError("multistep_max_steps must be >= 0")
 
 
 class WARPG:
@@ -84,6 +109,9 @@ class WARPG:
         self.design_timings: dict[str, float] = {}
         self.interaction_analysis: dict[str, Any] = {}
         self.probe_labeling_online_cost: dict[str, Any] = {}
+        self.doc_to_regions: dict[str, list[str]] = {}
+        self.region_vectors: dict[str, list[float]] = {}
+        self.region_neighbors: dict[str, dict[str, float]] = {}
 
     def fit(self, bundle: DatasetBundle) -> "WARPG":
         """完成基础索引、分区、特征、probe 和 benefit predictor 训练。"""
@@ -125,6 +153,7 @@ class WARPG:
         }
         self.coaccess = CoaccessGraphBuilder(
             self.config.coaccess_k, self.config.semantic_k, self.config.semantic_lambda,
+            weight_mode=self.config.coaccess_weight,
         ).build(
             bundle.documents, bundle.train, self.base,
             query_top_ids={
@@ -136,14 +165,18 @@ class WARPG:
             resolution=self.config.partition_resolution, seed=self.config.seed,
             min_region_size=self.config.min_region_size,
         )
+        cost_fn = lambda doc_ids, documents=bundle.documents: self.graph_builder.estimate_cost(
+            Region("__cost__", list(doc_ids)), documents,
+        )
+        partition_kwargs = {"cost_fn": cost_fn, "max_cost": self.config.max_region_cost}
         if self.config.partition_mode == "combined":
-            self.regions = partitioner.partition(self.coaccess)
+            self.regions = partitioner.partition(self.coaccess, **partition_kwargs)
         elif self.config.partition_mode == "query":
             query_graph = CoaccessGraph(
                 self.coaccess.nodes, dict(self.coaccess.query_edges), dict(self.coaccess.query_edges), {},
                 self.coaccess.query_results,
             )
-            self.regions = partitioner.partition(query_graph)
+            self.regions = partitioner.partition(query_graph, **partition_kwargs)
         elif self.config.partition_mode == "semantic":
             semantic_edges = {key: self.config.semantic_lambda * value
                               for key, value in self.coaccess.semantic_edges.items()}
@@ -151,20 +184,34 @@ class WARPG:
                 self.coaccess.nodes, semantic_edges, {}, dict(self.coaccess.semantic_edges),
                 self.coaccess.query_results,
             )
-            self.regions = partitioner.partition(semantic_graph)
+            self.regions = partitioner.partition(semantic_graph, **partition_kwargs)
         else:
-            reference = partitioner.partition(self.coaccess)
+            reference = partitioner.partition(self.coaccess, **partition_kwargs)
             shuffled = list(self.coaccess.nodes)
             random.Random(self.config.seed).shuffle(shuffled)
-            sizes = [len(region.doc_ids) for region in reference]
+            sizes = [len(region.metadata.get("core_doc_ids") or region.doc_ids) for region in reference]
             offset = 0
             self.regions = []
             for index, size in enumerate(sizes):
-                self.regions.append(Region(f"r{index:04d}", sorted(shuffled[offset:offset + size])))
+                ids = sorted(shuffled[offset:offset + size])
+                self.regions.append(Region(
+                    f"r{index:04d}", ids, metadata={"core_doc_ids": ids, "boundary_doc_ids": []},
+                ))
                 offset += size
+        self.regions = replicate_boundaries(self.regions, self.coaccess, self.config.boundary_replication)
         self.design_timings["partition_seconds"] = time.perf_counter() - started
         self.region_map = {region.id: region for region in self.regions}
-        self.doc_region = {doc_id: region.id for region in self.regions for doc_id in region.doc_ids}
+        self.doc_region = {
+            doc_id: region.id
+            for region in self.regions
+            for doc_id in (region.metadata.get("core_doc_ids") or region.doc_ids)
+        }
+        self.doc_to_regions = {}
+        for region in self.regions:
+            for doc_id in region.doc_ids:
+                self.doc_to_regions.setdefault(doc_id, []).append(region.id)
+        self.region_neighbors = region_coaccess_neighbors(self.regions, self.coaccess)
+        self.region_vectors = self._fit_region_router()
         started = time.perf_counter()
         extractor = RegionFeatureExtractor(
             self.config.routing_k, self.config.candidate_k, self.config.retrieval_k,
@@ -183,19 +230,41 @@ class WARPG:
             self.config.probe_fraction, self.config.retrieval_k, self.config.candidate_k,
             self.config.benefit_objective, self.config.seed,
         )
-        probe_regions = prober.select_probe_regions(self.regions, self.features, self.costs)
+        eligible_count = sum(1 for region in self.regions if self.features[region.id].query_freq > 0)
+        if eligible_count < 6:
+            raise ValueError("Scientific benefit prediction requires at least six workload-covered regions")
+        probe_total = min(eligible_count, max(6, round(eligible_count * self.config.probe_fraction)))
         labeling_before = self.graph_retriever.stats()
-        # probe 标签与最终系统共用 candidate/RRF/CE；融合前仍用 Hybrid 候选，避免双重 rerank。
-        self.probes = prober.run(probe_regions, bundle.documents, bundle.train,
-                                 self.region_queries, hybrid_by_query)
-        # probe 打标阶段的在线图检索 token 单独入账，供 design-search 口径完整报告。
+        if self.config.probe_strategy == "active" and probe_total >= 8:
+            round1 = max(4, probe_total // 2)
+            first = prober.select_probe_regions(
+                self.regions, self.features, self.costs, count=round1, strategy="active",
+            )
+            self.probes = prober.run(first, bundle.documents, bundle.train,
+                                     self.region_queries, hybrid_by_query)
+            gains = {region_id: outcome.gain for region_id, outcome in self.probes.items()}
+            interim = BenefitPredictor(self.config.seed).fit(self.features, gains)
+            predicted = interim.predict(self.features)
+            second = prober.select_probe_regions(
+                self.regions, self.features, self.costs, count=probe_total - round1,
+                predicted_gains=predicted, already_probed=set(self.probes), strategy="active",
+            )
+            more = prober.run(second, bundle.documents, bundle.train,
+                              self.region_queries, hybrid_by_query)
+            self.probes.update(more)
+        else:
+            probe_regions = prober.select_probe_regions(
+                self.regions, self.features, self.costs, count=probe_total,
+                strategy=self.config.probe_strategy,
+            )
+            self.probes = prober.run(probe_regions, bundle.documents, bundle.train,
+                                     self.region_queries, hybrid_by_query)
         self.probe_labeling_online_cost = self.graph_retriever.delta(labeling_before)
         self.graphs.update({region_id: outcome.graph for region_id, outcome in self.probes.items()})
         gains = {region_id: outcome.gain for region_id, outcome in self.probes.items()}
         started = time.perf_counter()
         self.predictor = BenefitPredictor(self.config.seed).fit(self.features, gains)
         self.predicted_gains = self.predictor.predict(self.features)
-        # A measured probe label is more reliable than its fitted value.
         self.predicted_gains.update(gains)
         self.design_timings["predictor_seconds"] = time.perf_counter() - started
         if self.config.interaction_pairs == 0:
@@ -209,21 +278,29 @@ class WARPG:
         return self
 
     def routing_diagnostics(self, queries: list[Any]) -> dict[str, float]:
-        """测量 Base router 能否命中 gold evidence 所在 Region。"""
+        """测量 Base-hit 与独立 region router 能否命中 gold 所在 Region。"""
         eligible = [query for query in queries if query.gold_doc_ids]
         if not eligible:
             raise ValueError("Routing diagnostics require gold evidence")
-        complete = any_hit = 0.0
+        base_complete = base_any = combined_complete = combined_any = 0.0
         for query in eligible:
-            gold_regions = {self.doc_region[doc_id] for doc_id in query.gold_doc_ids}
-            routed = {self.doc_region[result.doc_id]
-                      for result in self.rank_base(query.text, self.config.routing_k)}
-            complete += float(gold_regions.issubset(routed))
-            any_hit += float(bool(gold_regions & routed))
+            gold_regions = {
+                self.doc_region[doc_id] for doc_id in query.gold_doc_ids if doc_id in self.doc_region
+            }
+            ranked = self.rank_base(query.text, self.config.routing_k)
+            base_hit = self._base_hit_regions(ranked, set(self.region_map))
+            routed = self._route_regions(query.text, ranked, set(self.region_map))
+            base_complete += float(gold_regions.issubset(set(base_hit)))
+            base_any += float(bool(gold_regions & set(base_hit)))
+            combined_complete += float(gold_regions.issubset(set(routed["routed_regions"])))
+            combined_any += float(bool(gold_regions & set(routed["routed_regions"])))
+        n = len(eligible)
         return {
-            "queries": float(len(eligible)),
-            "any_gold_region_recall": any_hit / len(eligible),
-            "complete_gold_region_recall": complete / len(eligible),
+            "queries": float(n),
+            "any_gold_region_recall": base_any / n,
+            "complete_gold_region_recall": base_complete / n,
+            "router_any_gold_region_recall": combined_any / n,
+            "router_complete_gold_region_recall": combined_complete / n,
         }
 
     def _probe_interactions(self) -> dict[str, Any]:
@@ -270,11 +347,15 @@ class WARPG:
 
     def select(self, method: str = "warp") -> list[str]:
         """WARP 按 score_i 选择；controls 只换排序公式，并取相同区域数。"""
-        warp_selected = self.selector.select("warp", self.features, self.costs, self.predicted_gains)
+        warp_selected = self.selector.select(
+            "warp", self.features, self.costs, self.predicted_gains,
+            region_queries=self.region_queries,
+        )
         if method == "warp":
             return warp_selected
         return self.selector.select(
             method, self.features, self.costs, self.predicted_gains, limit=len(warp_selected),
+            region_queries=self.region_queries,
         )
 
     def rank_base(self, query: str, k: int | None = None) -> list[SearchResult]:
@@ -327,7 +408,13 @@ class WARPG:
             }, ensure_ascii=False), flush=True)
 
     def search(self, query: str, k: int | None = None, selected_regions: set[str] | None = None) -> list[SearchResult]:
-        """先跑完整 Base，用 top-routing_k 查表，只查询已物化且被 Base 命中的图。"""
+        """Base + region router + cheap bridge，只查询已物化区域图。"""
+        return self.search_with_trace(query, k, selected_regions)[0]
+
+    def search_with_trace(
+        self, query: str, k: int | None = None, selected_regions: set[str] | None = None,
+    ) -> tuple[list[SearchResult], dict[str, Any]]:
+        """返回检索结果与路由轨迹，供多步 log 使用。"""
         k = self.config.retrieval_k if k is None else k
         base_candidates = self.base.search(query, self.config.candidate_k)
         base_ranked = fuse_and_rerank(
@@ -337,18 +424,86 @@ class WARPG:
         )
         if selected_regions is None:
             selected_regions = set(self.graphs)
-        # 路由是确定性的文档归属查表，不使用 LLM/agent 做检索决策。
-        routed: list[str] = []
-        for result in base_ranked[:self.config.routing_k]:
-            region_id = self.doc_region[result.doc_id]
-            if region_id in selected_regions and region_id not in routed:
-                routed.append(region_id)
-        graph_results = [self.graph_retriever.search(query, self.graphs[region_id], self.config.candidate_k)
-                         for region_id in routed if region_id in self.graphs]
-        return fuse_and_rerank(
+        trace = self._route_regions(query, base_ranked, selected_regions)
+        graph_results = []
+        for region_id in trace["routed_regions"]:
+            if region_id not in self.graphs:
+                continue
+            hits = self.graph_retriever.search(query, self.graphs[region_id], self.config.candidate_k)
+            for item in hits:
+                item.region_id = region_id
+            graph_results.append(hits)
+        fused = fuse_and_rerank(
             query, [base_candidates] + graph_results, self.reranker,
             k=k, candidate_k=self.config.candidate_k, source="warp",
         )
+        return fused, trace
+
+    def _fit_region_router(self) -> dict[str, list[float]]:
+        vectors: dict[str, list[float]] = {}
+        for region in self.regions:
+            core = region.metadata.get("core_doc_ids") or region.doc_ids
+            if not core:
+                continue
+            rows = [self.base.dense.vector(doc_id) for doc_id in core]
+            dim = len(rows[0])
+            vectors[region.id] = [sum(row[index] for row in rows) / len(rows) for index in range(dim)]
+        return vectors
+
+    def _base_hit_regions(self, ranked: list[SearchResult], selected_regions: set[str]) -> list[str]:
+        routed: list[str] = []
+        for result in ranked[:self.config.routing_k]:
+            for region_id in self.doc_to_regions.get(result.doc_id, []):
+                if region_id in selected_regions and region_id not in routed:
+                    routed.append(region_id)
+        return routed
+
+    def _route_regions(
+        self, query: str, ranked: list[SearchResult], selected_regions: set[str],
+    ) -> dict[str, list[str]]:
+        base_hit = self._base_hit_regions(ranked, selected_regions)
+        router_regions: list[str] = []
+        if self.config.region_router_k > 0 and self.region_vectors:
+            query_vector = self.base.dense.encode([query])[0]
+            scored = sorted(
+                (
+                    (region_id, cosine(query_vector, vector))
+                    for region_id, vector in self.region_vectors.items()
+                    if region_id in selected_regions
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+            for region_id, _score in scored[:self.config.region_router_k]:
+                if region_id not in router_regions:
+                    router_regions.append(region_id)
+        seeded = list(dict.fromkeys(base_hit + router_regions))
+        bridge_regions: list[str] = []
+        if self.config.bridge_k > 0:
+            weights: dict[str, float] = {}
+            for region_id in seeded:
+                for other, weight in self.region_neighbors.get(region_id, {}).items():
+                    if other in selected_regions and other not in seeded:
+                        weights[other] = weights.get(other, 0.0) + weight
+            for region_id, _weight in sorted(weights.items(), key=lambda item: (-item[1], item[0]))[:self.config.bridge_k]:
+                bridge_regions.append(region_id)
+        routed = list(dict.fromkeys(seeded + bridge_regions))
+        return {
+            "base_hit_regions": base_hit,
+            "router_regions": router_regions,
+            "bridge_regions": bridge_regions,
+            "routed_regions": routed,
+        }
+
+    def generate_next_query(self, prompt: str) -> str:
+        """多步检索的 LLM 扩展；无共享 LLM 时返回空字符串以停止。"""
+        llm = getattr(self.graph_builder, "_shared_llm", None)
+        if llm is None or not hasattr(llm, "infer"):
+            return "END"
+        result = llm.infer(prompt)
+        if not isinstance(result, tuple) or not result:
+            return "END"
+        text = result[0]
+        return str(text or "").strip()
 
     def materialize_full_graph(self) -> RegionalGraph:
         """Build one corpus-wide graph for the true Full Graph baseline.
@@ -374,36 +529,39 @@ class WARPG:
             k=k, candidate_k=self.config.candidate_k, source="full_graph",
         )
 
-    def evaluate_full_graph(self, queries: list[Any], ks: tuple[int, ...] = (5, 10)) -> dict[str, Any]:
+    def evaluate_full_graph(self, queries: list[Any], ks: tuple[int, ...] | None = None) -> dict[str, Any]:
         """评测 Base + Full Graph fusion。"""
         self.materialize_full_graph()
-        return evaluate_retrieval(queries, self.search_full_graph, ks, bootstrap_seed=self.config.seed)
+        return evaluate_retrieval(
+            queries, self.search_full_graph, ks or self.config.retrieval_ks,
+            bootstrap_seed=self.config.seed,
+        )
 
-    def evaluate_full_graph_only(self, queries: list[Any], ks: tuple[int, ...] = (5, 10)) -> dict[str, Any]:
+    def evaluate_full_graph_only(self, queries: list[Any], ks: tuple[int, ...] | None = None) -> dict[str, Any]:
         """评测官方图检索通路；仍使用共享 CrossEncoder。"""
         graph = self.materialize_full_graph()
         return evaluate_retrieval(
             queries, lambda query, k: fuse_and_rerank(
-                query, [self.graph_retriever.search(query, graph, self.config.candidate_k)], self.reranker,
-                k=k, candidate_k=self.config.candidate_k, source="hipporag2_reranked",
-            ), ks, bootstrap_seed=self.config.seed,
+                query, [self.graph_retriever.search(query, graph, self.config.candidate_k)],
+                self.reranker, k=k, candidate_k=self.config.candidate_k, source="hipporag2_reranked",
+            ), ks or self.config.retrieval_ks, bootstrap_seed=self.config.seed,
         )
 
-    def evaluate(self, queries: list[Any], selected_regions: list[str], ks: tuple[int, ...] = (5, 10)) -> dict[str, Any]:
+    def evaluate(self, queries: list[Any], selected_regions: list[str], ks: tuple[int, ...] | None = None) -> dict[str, Any]:
         """物化给定区域并评测 Selective Regional Graph 系统。"""
         self.materialize(selected_regions)
         selected = set(selected_regions)
         return evaluate_retrieval(
-            queries, lambda query, k: self.search(query, k, selected), ks,
-            bootstrap_seed=self.config.seed,
+            queries, lambda query, k: self.search(query, k, selected),
+            ks or self.config.retrieval_ks, bootstrap_seed=self.config.seed,
         )
 
-    def evaluate_base(self, queries: list[Any], method: str, ks: tuple[int, ...] = (5, 10)) -> dict[str, Any]:
+    def evaluate_base(self, queries: list[Any], method: str, ks: tuple[int, ...] | None = None) -> dict[str, Any]:
         """评测 BM25、Dense 或 Hybrid 基础检索。"""
         normalized = "hybrid" if method.lower() == "base" else method.lower()
         return evaluate_retrieval(
-            queries, lambda query, k: self.search_base(query, k, normalized), ks,
-            bootstrap_seed=self.config.seed,
+            queries, lambda query, k: self.search_base(query, k, normalized),
+            ks or self.config.retrieval_ks, bootstrap_seed=self.config.seed,
         )
 
     def report(self) -> dict[str, Any]:

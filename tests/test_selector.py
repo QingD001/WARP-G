@@ -58,6 +58,18 @@ class RegionSelectorTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.selector.select("warp", 0.2, self.features, self.costs, self.gains)
 
+    def test_warp_falls_back_to_query_freq_without_region_queries(self) -> None:
+        selected = self.selector.select("warp", self.features, self.costs, self.gains, region_queries={})
+        self.assertEqual(selected, ["r1"])
+
+    def test_warp_uses_coverage_discount_not_knapsack(self) -> None:
+        region_queries = {"r1": ["q1", "q2"], "r3": ["q1"]}
+        selected = self.selector.select(
+            "warp", self.features, self.costs, self.gains, region_queries=region_queries,
+        )
+        self.assertEqual(selected[0], "r3")
+        self.assertEqual(set(selected), {"r1", "r3"})
+
 
 class ExperimentOrderTest(unittest.TestCase):
     def test_methods_follow_design_order(self) -> None:

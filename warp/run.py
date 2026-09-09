@@ -22,6 +22,8 @@ import torch
 from warp.baselines import GlobalBaselineFactory
 from warp.data import load_crossfit_bundles
 from warp.eval.construction_cost import aggregate_costs, attach_token_efficiency, consumed_tokens, usage_to_cost
+from warp.eval.cutoffs import RETRIEVAL_KS, metric_names
+from warp.eval.multistep import run_multistep_retrieval
 from warp.eval.reader import evaluate_hipporag2_reader
 from warp.eval.retrieval import evaluate_retrieval
 from warp.eval.statistics import paired_bootstrap_interval, paired_randomization_pvalue
@@ -32,7 +34,7 @@ from warp.retrieval import BM25Retriever, CrossEncoderReranker, DenseRetriever, 
 from warp.utils import write_json
 
 
-METRICS = ("evidence_recall@5", "evidence_recall@10", "complete_evidence@5", "complete_evidence@10")
+METRICS = metric_names(RETRIEVAL_KS)
 TOKEN_EFFICIENCY_KEYS = (
     "total_tokens_excluding_design", "total_tokens_including_design",
     "token_efficiency_excluding_design", "token_efficiency_including_design",
@@ -57,6 +59,58 @@ def _ordered_methods(methods: list[str]) -> list[str]:
             ordered.append(name)
             remaining.remove(name)
     return ordered + remaining
+
+
+def _empty_route_trace() -> dict[str, list[str]]:
+    return {"base_hit_regions": [], "router_regions": [], "bridge_regions": [], "routed_regions": []}
+
+
+def _with_empty_trace(search: Any) -> Any:
+    def wrapped(query: str, k: int) -> tuple[Any, dict[str, list[str]]]:
+        return search(query, k), _empty_route_trace()
+    return wrapped
+
+
+def _with_usage_trace(search_trace: Any, retriever: Any) -> Any:
+    def wrapped(query: str, k: int) -> tuple[Any, dict[str, Any]]:
+        before = retriever.stats() if retriever is not None else {}
+        results, trace = search_trace(query, k)
+        payload = dict(trace or {})
+        if retriever is not None:
+            payload["tokens"] = retriever.delta(before)
+        return results, payload
+    return wrapped
+
+
+def _hydrate_ranked_cache(*groups: list[dict[str, Any]]) -> dict[str, dict[str, list[dict[str, Any]]]]:
+    cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for group in groups:
+        for row in group:
+            method = str(row.get("method") or "").lower()
+            ranked = row.get("ranked_results")
+            if method and isinstance(ranked, dict) and ranked:
+                cache[method] = ranked
+    return cache
+
+
+def _attach_multistep(
+    metrics: dict[str, Any], *, method: str, search_trace: Any, generate: Any,
+    queries: Any, model: Any, log_dir: Path | None,
+) -> dict[str, Any]:
+    steps = int(model.config.multistep_max_steps)
+    if steps <= 0:
+        return metrics
+    log_path = None if log_dir is None else log_dir / f"{method}.jsonl"
+    summary = run_multistep_retrieval(
+        queries, _with_usage_trace(search_trace, getattr(model, "graph_retriever", None)), generate,
+        max_steps=steps,
+        retrieval_k=int(model.config.retrieval_k),
+        ks=tuple(model.config.retrieval_ks),
+        log_path=log_path,
+        method=method,
+    )
+    metrics["multistep"] = {key: value for key, value in summary.items() if key != "ranked_results"}
+    return metrics
 
 
 def load_config(path: str) -> dict[str, Any]:
@@ -134,7 +188,8 @@ def _summarize(
     for group_key, values in sorted(groups.items()):
         item = {key: value for key, value in zip(keys, group_key)}
         item["trials"] = len(values)
-        for metric in metric_names:
+        present = [metric for metric in metric_names if all(metric in row for row in values)]
+        for metric in present:
             samples = [float(row[metric]) for row in values]
             item[f"{metric}_mean"] = statistics.fmean(samples)
             item[f"{metric}_std"] = statistics.stdev(samples) if len(samples) > 1 else 0.0
@@ -174,7 +229,8 @@ def _crossfit_summary(
             **{key: value for key, value in zip(keys, group_key)},
             "folds": len(values), "num_queries": len(per_query),
         }
-        for metric in metric_names:
+        present = [metric for metric in metric_names if all(metric in metrics for metrics in per_query.values())]
+        for metric in present:
             samples = [float(metrics[metric]) for metrics in per_query.values()]
             lower, upper = paired_bootstrap_interval(samples, seed=seed)
             item[metric] = statistics.fmean(samples)
@@ -212,7 +268,10 @@ def _significance(rows: list[dict[str, Any]], samples: int, seed: int) -> list[d
         query_ids = sorted(candidate_per_query)
         if set(query_ids) != set(reference_per_query):
             raise ValueError("Cross-fit significance requires identical held-out query coverage")
-        for metric in METRICS:
+        present = [metric for metric in METRICS
+                   if all(metric in candidate_per_query[query_id] for query_id in query_ids)
+                   and all(metric in reference_per_query[query_id] for query_id in query_ids)]
+        for metric in present:
             candidate = [candidate_per_query[query_id][metric] for query_id in query_ids]
             baseline = [reference_per_query[query_id][metric] for query_id in query_ids]
             output.append({
@@ -253,7 +312,8 @@ def _quality_cost_auc(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             groups.setdefault(row.get("budget_fraction"), []).append(row)
         for trials in groups.values():
             cost = statistics.fmean(float(row["actual_cost_fraction"]) for row in trials)
-            metrics = {metric: statistics.fmean(float(row[metric]) for row in trials) for metric in METRICS}
+            present = [metric for metric in METRICS if all(metric in row for row in trials)]
+            metrics = {metric: statistics.fmean(float(row[metric]) for row in trials) for metric in present}
             efficiency = [
                 row["token_efficiency_excluding_design"]
                 for row in trials if row.get("token_efficiency_excluding_design") is not None
@@ -324,6 +384,11 @@ def _run_fold_experiment(
     design_reports: list[dict[str, Any]] = []
     reader_trials: list[dict[str, Any]] = list(progress["reader_evaluation_trials"])
     partition_ablation_rows: list[dict[str, Any]] = []
+    retrieval_cache: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    multistep_dir = (
+        checkpoint_output.with_name(f"{checkpoint_output.stem}.multistep")
+        if checkpoint_output is not None else None
+    )
     full_graph_trials = [
         row for row in progress["baseline_trials"] if str(row.get("method")).lower() in GRAPH_BASELINE_METHODS
     ]
@@ -389,6 +454,13 @@ def _run_fold_experiment(
                 continue
             before = graph_retriever.stats()
             metrics = model.evaluate_base(bundle.test, method)
+            retrieval_cache[method] = metrics.get("ranked_results") or {}
+            metrics = _attach_multistep(
+                metrics, method=method,
+                search_trace=_with_empty_trace(lambda query, k, method=method: model.search_base(query, k, method)),
+                generate=model.generate_next_query, queries=bundle.test, model=model,
+                log_dir=multistep_dir,
+            )
             baseline_row = {
                 "design_seed": design_seed, "fold": fold, "method": method,
                 "online_retrieval_cost": graph_retriever.delta(before), **metrics,
@@ -410,6 +482,14 @@ def _run_fold_experiment(
             if method in REGIONAL_METHODS:
                 selected = model.select(method)
                 metrics = model.evaluate(bundle.test, selected)
+                retrieval_cache[method] = metrics.get("ranked_results") or {}
+                selected_set = set(selected)
+                metrics = _attach_multistep(
+                    metrics, method=method,
+                    search_trace=lambda query, k, selected_set=selected_set: model.search_with_trace(query, k, selected_set),
+                    generate=model.generate_next_query, queries=bundle.test, model=model,
+                    log_dir=multistep_dir,
+                )
                 deployment_cost = aggregate_costs([model.graphs[key].cost for key in selected])
                 selected_ids: dict[str, Any] = {
                     "selected_regions": selected,
@@ -422,7 +502,15 @@ def _run_fold_experiment(
                     raise RuntimeError("Global baseline factory was not initialized")
                 baseline = factory.build(method)
                 metrics = evaluate_retrieval(
-                    bundle.test, baseline.search, bootstrap_seed=design_seed,
+                    bundle.test, baseline.search, ks=tuple(model.config.retrieval_ks),
+                    bootstrap_seed=design_seed,
+                )
+                retrieval_cache[method] = metrics.get("ranked_results") or {}
+                metrics = _attach_multistep(
+                    metrics, method=method,
+                    search_trace=_with_empty_trace(baseline.search),
+                    generate=model.generate_next_query, queries=bundle.test, model=model,
+                    log_dir=multistep_dir,
                 )
                 deployment_cost = baseline.cost
                 selected_ids = {
@@ -493,9 +581,27 @@ def _run_fold_experiment(
         else:
             before = graph_retriever.stats()
             full_metrics = model.evaluate_full_graph(bundle.test)
+            retrieval_cache["full_graph"] = full_metrics.get("ranked_results") or {}
+            full_metrics = _attach_multistep(
+                full_metrics, method="full_graph",
+                search_trace=_with_empty_trace(model.search_full_graph),
+                generate=model.generate_next_query, queries=bundle.test, model=model,
+                log_dir=multistep_dir,
+            )
             full_online = graph_retriever.delta(before)
             before = graph_retriever.stats()
             graph_metrics = model.evaluate_full_graph_only(bundle.test)
+            retrieval_cache["hipporag2"] = graph_metrics.get("ranked_results") or {}
+            graph = model.materialize_full_graph()
+            graph_metrics = _attach_multistep(
+                graph_metrics, method="hipporag2",
+                search_trace=_with_empty_trace(lambda query, k, graph=graph: fuse_and_rerank(
+                    query, [model.graph_retriever.search(query, graph, model.config.candidate_k)],
+                    model.reranker, k=k, candidate_k=model.config.candidate_k, source="hipporag2_reranked",
+                )),
+                generate=model.generate_next_query, queries=bundle.test, model=model,
+                log_dir=multistep_dir,
+            )
             graph_online = graph_retriever.delta(before)
             full_cost = model.full_graph.cost
             full_graph_trials = [
@@ -520,38 +626,19 @@ def _run_fold_experiment(
         if bool(reader_config["enabled"]):
             reader_top_k = int(reader_config["top_k"])
             done_readers = {_baseline_row_key(row) for row in reader_trials}
+            retrieval_cache.update(_hydrate_ranked_cache(rows, baseline_trials, full_graph_trials))
             for method in [str(value).lower() for value in reader_config["methods"]]:
                 if (method, fold, design_seed) in done_readers:
                     print(json.dumps({
                         "fold_checkpoint": "reuse_reader", "fold": fold, "method": method,
                     }, ensure_ascii=False), flush=True)
                     continue
-                before = graph_retriever.stats()
-                if method in {"bm25", "dense", "hybrid"}:
-                    search = lambda query, k, method=method: model.search_base(query, k, method)
-                elif method == "hipporag2":
-                    graph = model.materialize_full_graph()
-                    search = lambda query, k, graph=graph: fuse_and_rerank(
-                        query, [model.graph_retriever.search(query, graph, model.config.candidate_k)],
-                        model.reranker, k=k, candidate_k=model.config.candidate_k, source="hipporag2_reranked",
+                ranked = retrieval_cache.get(method)
+                if not ranked:
+                    raise RuntimeError(
+                        f"Reader refuses to re-retrieve; missing ranked_results for {method}. "
+                        "The retrieval stage must run first in this fold."
                     )
-                elif method == "full_graph":
-                    search = model.search_full_graph
-                elif method in REGIONAL_METHODS:
-                    selected = model.select(method)
-                    model.materialize(selected)
-                    selected_set = set(selected)
-                    search = lambda query, k, selected_set=selected_set: model.search(query, k, selected_set)
-                elif method in GLOBAL_METHODS:
-                    if factory is None:
-                        raise RuntimeError("Global baseline factory was not initialized")
-                    baseline = factory.build(method)
-                    search = baseline.search
-                else:
-                    raise ValueError(f"Unknown reader method: {method}")
-                reader_metrics = evaluate_hipporag2_reader(
-                    bundle.test, search, bundle.documents, model.materialize_full_graph(), reader_top_k,
-                )
                 source = next(
                     (
                         row for row in [*rows, *baseline_trials, *full_graph_trials]
@@ -560,9 +647,12 @@ def _run_fold_experiment(
                     ),
                     {},
                 )
+                reader_metrics = evaluate_hipporag2_reader(
+                    bundle.test, ranked, bundle.documents, model.materialize_full_graph(), reader_top_k,
+                )
                 reader_row = {
                     "design_seed": design_seed, "fold": fold, "method": method,
-                    "online_retrieval_cost": graph_retriever.delta(before),
+                    "online_retrieval_cost": reader_metrics.get("reader_usage") or {},
                     "deployment_cost": source.get("deployment_cost") or source.get("actual_construction_cost"),
                     "first_run_cost_including_probe": source.get("first_run_cost_including_probe"),
                     **reader_metrics,
@@ -1007,18 +1097,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-interactions", action="store_true",
         help="Skip probe-region interaction measurement during fit",
     )
+    parser.add_argument(
+        "--skip-multistep", action="store_true",
+        help="Disable IRCoT multi-step retrieval after the single-pass evaluation",
+    )
     return parser
 
 
-def _apply_run_overrides(config: dict[str, Any], *, skip_reader: bool, skip_interactions: bool) -> dict[str, Any]:
+def _apply_run_overrides(
+    config: dict[str, Any], *, skip_reader: bool, skip_interactions: bool, skip_multistep: bool,
+) -> dict[str, Any]:
     updated = dict(config)
     if skip_reader:
         reader = dict(updated.get("reader") or {})
         reader["enabled"] = False
         updated["reader"] = reader
+    warp = dict(updated.get("warp") or {})
     if skip_interactions:
-        warp = dict(updated.get("warp") or {})
         warp["interaction_pairs"] = 0
+    if skip_multistep:
+        warp["multistep_max_steps"] = 0
+    if skip_interactions or skip_multistep:
         updated["warp"] = warp
     return updated
 
@@ -1028,14 +1127,18 @@ def main() -> None:
     if args.phase == "all":
         if args.partition_mode is not None:
             raise ValueError("--partition-mode is invalid with --phase all")
-        if args.max_folds is not None or args.skip_reader or args.skip_interactions:
-            raise ValueError("--max-folds/--skip-reader/--skip-interactions require --phase main or partition-ablation")
+        if args.max_folds is not None or args.skip_reader or args.skip_interactions or args.skip_multistep:
+            raise ValueError(
+                "--max-folds/--skip-reader/--skip-interactions/--skip-multistep "
+                "require --phase main or partition-ablation"
+            )
         result = _orchestrate_all_phases(args.config, Path(args.output))
     else:
         config = _apply_run_overrides(
             load_config(args.config),
             skip_reader=args.skip_reader,
             skip_interactions=args.skip_interactions,
+            skip_multistep=args.skip_multistep,
         )
         result = run_experiment(
             config, phase=args.phase, partition_mode=args.partition_mode,

@@ -1,22 +1,22 @@
-"""在任意检索结果上运行固定的官方 HippoRAG2 QA reader。"""
+"""在已缓存的检索结果上运行固定的官方 HippoRAG2 QA reader。"""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from warp.models import Document, Query, SearchResult
 from .qa import answer_em, answer_f1
+from .retrieval import ranked_from_payload
 
 
 def evaluate_hipporag2_reader(
     queries: list[Query],
-    search: Callable[[str, int], list[SearchResult]],
+    ranked_by_query: dict[str, list[SearchResult] | list[dict[str, Any]]],
     documents: list[Document],
     hipporag_graph: Any,
     top_k: int = 5,
 ) -> dict[str, Any]:
-    """Use HippoRAG 2's frozen QA prompt and QA LLM on arbitrary retrieval output."""
+    """Use HippoRAG 2's frozen QA prompt on cached retrieval output. Do not search again."""
     try:
         from hipporag.utils.misc_utils import QuerySolution
     except ImportError as exc:
@@ -24,18 +24,22 @@ def evaluate_hipporag2_reader(
     rag = hipporag_graph.backend
     if rag is None:
         raise TypeError("Reader evaluation requires an official HippoRAG2 full graph")
-    # Reader 始终使用同一个 full-graph HippoRAG 实例中的 prompt manager/QA LLM，
-    # 但 docs 由待比较的检索方法提供，因此只改变 evidence，不改变生成器。
     doc_map = {doc.id: doc for doc in documents}
     eligible = [query for query in queries if query.answer is not None]
     if not eligible:
         raise ValueError("Reader evaluation requires gold answers")
     solutions = []
     for query in eligible:
-        results = search(query.text, top_k)
+        payload = ranked_by_query.get(query.id)
+        if payload is None:
+            raise KeyError(
+                f"Reader is missing cached retrieval for {query.id!r}; "
+                "the retrieval stage must run first and pass ranked_results"
+            )
+        results = ranked_from_payload(payload) if not payload or not isinstance(payload[0], SearchResult) else payload
         solutions.append(QuerySolution(
             question=query.text,
-            docs=[doc_map[result.doc_id].content for result in results[:top_k]],
+            docs=[doc_map[result.doc_id].content for result in results[:top_k] if result.doc_id in doc_map],
             doc_scores=None,
             doc_metadata=[{"warp_doc_id": result.doc_id} for result in results[:top_k]],
         ))
@@ -48,7 +52,6 @@ def evaluate_hipporag2_reader(
         tracker.phase = "idle"
     em_total = f1_total = 0.0
     predictions: list[dict[str, Any]] = []
-    # 多答案问题取所有规范答案中的最佳 EM/F1，这是 QA benchmark 的常规口径。
     for query, solution in zip(eligible, answered):
         golds = query.answer if isinstance(query.answer, list) else [query.answer]
         em = max(answer_em(solution.answer, gold) for gold in golds)
@@ -61,4 +64,5 @@ def evaluate_hipporag2_reader(
     return {
         "answer_em": em_total / len(eligible), "answer_f1": f1_total / len(eligible),
         "num_queries": len(eligible), "reader_usage": usage, "predictions": predictions,
+        "reader_reused_retrieval": True,
     }

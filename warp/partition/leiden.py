@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 
 from warp.models import Region
 from .coaccess_graph import CoaccessGraph
@@ -16,15 +17,24 @@ class RegionPartitioner:
         self.seed = seed
         self.min_region_size = min_region_size
 
-    def partition(self, graph: CoaccessGraph) -> list[Region]:
-        """优先运行 Leiden，随后合并过小社区并生成稳定的 rXXXX ID。"""
+    def partition(
+        self, graph: CoaccessGraph,
+        cost_fn: Callable[[list[str]], float] | None = None,
+        max_cost: float | None = None,
+    ) -> list[Region]:
+        """优先运行 Leiden，合并过小社区，过贵则递归再切，再生成稳定 rXXXX ID。"""
         membership = self._leiden(graph)
         groups: dict[int, list[str]] = defaultdict(list)
         for node, community in zip(graph.nodes, membership):
             groups[int(community)].append(node)
         groups = self._merge_small(groups, graph)
+        groups = self._split_expensive(groups, graph, cost_fn, max_cost)
         ordered = sorted((sorted(ids) for ids in groups.values()), key=lambda ids: (ids[0], len(ids)))
-        return [Region(f"r{index:04d}", ids) for index, ids in enumerate(ordered)]
+        regions = []
+        for index, ids in enumerate(ordered):
+            region = Region(f"r{index:04d}", ids, metadata={"core_doc_ids": list(ids), "boundary_doc_ids": []})
+            regions.append(region)
+        return regions
 
     def _leiden(self, graph: CoaccessGraph) -> list[int]:
         import igraph as ig
@@ -64,3 +74,36 @@ class RegionPartitioner:
             for node in nodes:
                 node_group[node] = target
         return {key: value for key, value in groups.items() if value}
+
+    def _split_expensive(
+        self,
+        groups: dict[int, list[str]],
+        graph: CoaccessGraph,
+        cost_fn: Callable[[list[str]], float] | None,
+        max_cost: float | None,
+    ) -> dict[int, list[str]]:
+        """把估计成本超过上限的社区递归 Leiden，直到成为可物化 physical unit。"""
+        if cost_fn is None or max_cost is None or max_cost <= 0:
+            return groups
+        pending = [list(nodes) for nodes in groups.values() if nodes]
+        output: list[list[str]] = []
+        while pending:
+            nodes = pending.pop()
+            if len(nodes) <= max(self.min_region_size, 1) or cost_fn(nodes) <= max_cost:
+                output.append(nodes)
+                continue
+            subgraph = graph.subgraph(nodes)
+            if len(subgraph.nodes) <= 1 or not subgraph.edges:
+                output.append(nodes)
+                continue
+            membership = self._leiden(subgraph)
+            children: dict[int, list[str]] = defaultdict(list)
+            for node, community in zip(subgraph.nodes, membership):
+                children[int(community)].append(node)
+            children = self._merge_small(children, subgraph)
+            parts = [value for value in children.values() if value]
+            if len(parts) <= 1:
+                output.append(nodes)
+                continue
+            pending.extend(parts)
+        return {index: nodes for index, nodes in enumerate(output)}

@@ -16,6 +16,13 @@ warp:
   partition_mode: combined
   min_region_size: 5
   seed: 42
+  retrieval_ks: [2, 3, 5, 10]
+  region_router_k: 3
+  bridge_k: 1
+  boundary_replication: 0.05
+  coaccess_weight: rank_idf
+  probe_strategy: active
+  multistep_max_steps: 3
 graph:
   artifact_root: outputs/indexes/2wiki
   llm_name: deepseek-v4-flash

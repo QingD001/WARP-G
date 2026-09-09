@@ -39,7 +39,13 @@ class RegionFeatureExtractor:
     ) -> tuple[dict[str, RegionFeatures], dict[str, list[str]], dict[str, list[SearchResult]]]:
         """返回特征、region-query 路由关系和可复用的 Base 排序结果。"""
         doc_map = {doc.id: doc for doc in documents}
-        doc_region = {doc_id: region.id for region in regions for doc_id in region.doc_ids}
+        doc_region: dict[str, str] = {}
+        for region in regions:
+            core_ids = region.metadata.get("core_doc_ids") or region.doc_ids
+            for doc_id in core_ids:
+                if doc_id in doc_region:
+                    raise ValueError(f"Document {doc_id} belongs to multiple region cores")
+                doc_region[doc_id] = region.id
         if query_results is None:
             query_results = {
                 query.id: retriever.search(query.text, self.candidate_k) for query in queries
@@ -52,10 +58,11 @@ class RegionFeatureExtractor:
         for query in queries:
             seen: set[str] = set()
             for result in query_results[query.id][:self.routing_k]:
-                region_id = doc_region[result.doc_id]
-                if region_id not in seen:
-                    region_queries[region_id].append(query.id)
-                    seen.add(region_id)
+                region_id = doc_region.get(result.doc_id)
+                if region_id is None or region_id in seen:
+                    continue
+                region_queries[region_id].append(query.id)
+                seen.add(region_id)
 
         query_map = {query.id: query for query in queries}
         features: dict[str, RegionFeatures] = {}
@@ -65,7 +72,8 @@ class RegionFeatureExtractor:
             failures: list[float] = []
             entropies: list[float] = []
             multi_docs: list[float] = []
-            region_docs = set(region.doc_ids)
+            core_ids = list(region.metadata.get("core_doc_ids") or region.doc_ids)
+            region_docs = set(core_ids)
             for qid in qids:
                 query = query_map[qid]
                 # 构图前特征只统计本区 gold；probe 标签仍用整题 CompleteEvidence。
@@ -84,28 +92,28 @@ class RegionFeatureExtractor:
                     entropies.append(entropy)
 
             # dispersion 与 density 分别刻画语义异质性和真实 workload 内聚性。
-            pair_count = len(region.doc_ids) * (len(region.doc_ids) - 1) // 2
+            pair_count = len(core_ids) * (len(core_ids) - 1) // 2
             if pair_count <= self.dispersion_pairs:
-                all_pairs = list(combinations(region.doc_ids, 2))
+                all_pairs = list(combinations(core_ids, 2))
             else:
                 rng = random.Random(f"{self.seed}:{region.id}")
                 sampled_indices: set[tuple[int, int]] = set()
                 while len(sampled_indices) < self.dispersion_pairs:
-                    left, right = rng.sample(range(len(region.doc_ids)), 2)
+                    left, right = rng.sample(range(len(core_ids)), 2)
                     sampled_indices.add((min(left, right), max(left, right)))
-                all_pairs = [(region.doc_ids[left], region.doc_ids[right])
+                all_pairs = [(core_ids[left], core_ids[right])
                              for left, right in sorted(sampled_indices)]
             distances = [1.0 - cosine(retriever.dense.vector(left), retriever.dense.vector(right))
                          for left, right in all_pairs]
-            possible = len(region.doc_ids) * (len(region.doc_ids) - 1) / 2
+            possible = len(core_ids) * (len(core_ids) - 1) / 2
             internal_weight = sum(weight for (left, right), weight in coaccess.query_edges.items()
                                   if left in region_docs and right in region_docs)
             query_normalizer = max(len(queries), 1)
             density = internal_weight / max(possible * query_normalizer, 1.0)
             features[region.id] = RegionFeatures(
                 region_id=region.id,
-                num_docs=float(len(region.doc_ids)),
-                num_tokens=float(sum(len(tokenize(doc_map[doc_id].content)) for doc_id in region.doc_ids)),
+                num_docs=float(len(core_ids)),
+                num_tokens=float(sum(len(tokenize(doc_map[doc_id].content)) for doc_id in core_ids)),
                 query_freq=float(len(qids)),
                 base_recall=sum(recalls) / len(recalls) if recalls else 0.0,
                 failure_rate=sum(failures) / len(failures) if failures else 0.0,

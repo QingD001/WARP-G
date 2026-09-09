@@ -70,13 +70,31 @@ class RegionProber:
         self.objective = objective
         self.seed = seed
 
-    def select_probe_regions(self, regions: list[Region], features: dict[str, RegionFeatures],
-                             costs: dict[str, float]) -> list[Region]:
-        eligible = [region for region in regions if features[region.id].query_freq > 0]
-        count = min(len(eligible), max(6, round(len(eligible) * self.probe_fraction)))
-        if len(eligible) < 6:
-            raise ValueError("Scientific benefit prediction requires at least six workload-covered regions")
-        # 沿 workload density、failure 与估算 cost 三轴排序后轮转桶抽样。
+    def select_probe_regions(
+        self, regions: list[Region], features: dict[str, RegionFeatures],
+        costs: dict[str, float], count: int | None = None,
+        predicted_gains: dict[str, float] | None = None,
+        already_probed: set[str] | None = None,
+        strategy: str = "active",
+    ) -> list[Region]:
+        eligible = [
+            region for region in regions
+            if features[region.id].query_freq > 0 and region.id not in (already_probed or set())
+        ]
+        target = count if count is not None else min(len(eligible), max(6, round(len(eligible) * self.probe_fraction)))
+        if len(eligible) < 1:
+            raise ValueError("Active probing requires workload-covered regions")
+        target = min(target, len(eligible))
+        if strategy == "stratified":
+            return self._select_stratified(eligible, features, costs, target)
+        if predicted_gains:
+            return self._select_uncertain(eligible, features, predicted_gains, target)
+        return self._select_demand_diverse(eligible, features, costs, target)
+
+    def _select_stratified(
+        self, eligible: list[Region], features: dict[str, RegionFeatures],
+        costs: dict[str, float], count: int,
+    ) -> list[Region]:
         ordered = sorted(eligible, key=lambda region: (
             features[region.id].query_freq / features[region.id].num_tokens,
             features[region.id].failure_rate,
@@ -86,6 +104,45 @@ class RegionProber:
         rng = random.Random(self.seed)
         buckets = [ordered[index::count] for index in range(count)]
         return sorted((rng.choice(bucket) for bucket in buckets), key=lambda region: region.id)
+
+    def _select_demand_diverse(
+        self, eligible: list[Region], features: dict[str, RegionFeatures],
+        costs: dict[str, float], count: int,
+    ) -> list[Region]:
+        """第一轮：沿 failure/demand/cost 分桶，桶内取 demand×failure 最大而不是随机。"""
+        ordered = sorted(eligible, key=lambda region: (
+            features[region.id].query_freq / max(features[region.id].num_tokens, 1.0),
+            features[region.id].failure_rate,
+            costs[region.id],
+            region.id,
+        ))
+        buckets = [ordered[index::count] for index in range(count)]
+        chosen = []
+        for bucket in buckets:
+            chosen.append(max(
+                bucket,
+                key=lambda region: (
+                    features[region.id].query_freq * features[region.id].failure_rate,
+                    features[region.id].query_freq,
+                    region.id,
+                ),
+            ))
+        return sorted(chosen, key=lambda region: region.id)
+
+    def _select_uncertain(
+        self, eligible: list[Region], features: dict[str, RegionFeatures],
+        predicted_gains: dict[str, float], count: int,
+    ) -> list[Region]:
+        """后续轮：高需求且预测接近决策边界的区域。"""
+        ranked = sorted(
+            eligible,
+            key=lambda region: (
+                -features[region.id].query_freq / (abs(predicted_gains.get(region.id, 0.0)) + 1e-6),
+                -features[region.id].failure_rate,
+                region.id,
+            ),
+        )
+        return sorted(ranked[:count], key=lambda region: region.id)
 
     def run(
         self, probe_regions: list[Region], documents: list[Document], queries: list[Query],
